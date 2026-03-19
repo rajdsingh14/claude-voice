@@ -13,7 +13,10 @@ Installs as a Claude Code **Stop hook**. After every response, Claude's text is 
 - **Karaoke highlighting** — current word lit up, gradient around it, progress bar with word count
 - **Fully local** — no API keys, no cloud, no internet. Audio never leaves your machine
 - **12 voices** — American/British, male/female. Warm, deep, polished, casual — pick your style
+- **Speed control** — adjustable speech rate via config
+- **WAV saving** — optionally save audio to disk and open in QuickTime Player for replay/scrub
 - **Smart filtering** — skips code-heavy responses, strips markdown/URLs/tables, fixes dev pronunciations (CLI, API, JSON, nginx, kubectl)
+- **Process locking** — new responses automatically stop any previous audio still playing
 - **Interrupt on keypress** — press any key to stop immediately
 - **One-command setup** — `claude-voice setup` adds the hook automatically
 
@@ -48,8 +51,10 @@ claude-voice --long "text"      # no truncation for long text
 | `af_heart` * | American female, warm & expressive |
 | `af_nova` | American female, clear & professional |
 | `af_alloy` | American female, smooth & neutral |
+| `af_sky` | American female, bright |
 | `am_adam` | American male, natural |
 | `am_fenrir` | American male, deep & strong |
+| `am_michael` | American male, casual |
 | `am_onyx` | American male, smooth & confident |
 | `bm_george` | British male, polished |
 | `bm_daniel` | British male, warm |
@@ -65,12 +70,26 @@ Config lives at `~/.config/claude-voice/config.json`:
 ```json
 {
   "voice": "af_heart",
+  "speed": 1.0,
   "min_chars": 30,
-  "max_chars": 1500,
+  "max_chars": 50000,
   "chime": true,
-  "enabled": true
+  "done_pause": 0.5,
+  "enabled": true,
+  "audio_dir": "/path/to/save/wavs"
 }
 ```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `voice` | `af_heart` | Kokoro voice ID |
+| `speed` | `1.0` | Speech rate — `1.3` is 30% faster, `0.8` is slower |
+| `min_chars` | `30` | Skip responses shorter than this |
+| `max_chars` | `50000` | Truncate responses longer than this |
+| `chime` | `true` | Play start/end chimes |
+| `done_pause` | `0.5` | Seconds to pause after speech ends |
+| `enabled` | `true` | Master on/off toggle |
+| `audio_dir` | none | If set, saves WAV files here and opens in QuickTime Player instead of playing via sounddevice |
 
 ## How it works
 
@@ -79,10 +98,12 @@ Config lives at `~/.config/claude-voice/config.json`:
 3. Strips markdown, code blocks, URLs, tables — keeps only speakable text
 4. Skips if response is mostly code (>50% inside fences)
 5. Fixes dev term pronunciation (CLI → "C L I", JSON → "jason", etc.)
-6. Generates audio with Kokoro TTS, concatenates all sentences into one seamless buffer
-7. Plays audio while rendering word-by-word highlighting to `/dev/tty`
-8. Background thread listens for keypress — any key interrupts instantly
-9. Cleans up display when done
+6. Acquires an exclusive lock — kills any previous instance still speaking
+7. Generates audio with Kokoro TTS at the configured speed, concatenates all sentences into one seamless buffer
+8. **Hook mode**: saves WAV to `audio_dir` and opens in QuickTime, or falls back to sounddevice playback
+9. **Standalone mode**: plays audio while rendering word-by-word karaoke highlighting to `/dev/tty`
+10. Background thread listens for keypress — any key interrupts instantly
+11. Cleans up display and releases lock when done
 
 ## Benchmark
 
@@ -109,7 +130,7 @@ Warm TTFA (time to first audio) under 1 second. First run is ~6s due to model lo
 - Python 3.11+
 - `kokoro`, `sounddevice`, `numpy`
 - `espeak-ng` (system package for phonemization)
-- Works on Linux. macOS support untested but likely works.
+- Works on macOS and Linux
 - Tested on Kitty, Ghostty, Alacritty. Any terminal with ANSI true color support.
 
 ## License
