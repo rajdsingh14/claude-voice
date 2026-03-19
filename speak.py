@@ -17,17 +17,20 @@ Commands:
     claude-voice --voice af_nova "text"   Speak with a specific voice
 """
 import argparse
+import fcntl
 import json
 import os
 import re
 import select
 import signal
+import subprocess
 import sys
 import termios
 import threading
 import time
 import tty
 import warnings
+import wave
 
 warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch")
 warnings.filterwarnings("ignore", category=UserWarning, module=r"torch")
@@ -48,12 +51,14 @@ DEFAULT_VOICE = "af_heart"
 SAMPLE_RATE = 24000
 WINDOW = 8
 MIN_CHARS = 30
-MAX_CHARS = 1500
+MAX_CHARS = 50000
 DONE_PAUSE = 0.5
 CHIME_ENABLED = True
 CONFIG_PATH = os.path.expanduser("~/.config/claude-voice/config.json")
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 SCRIPT_PATH = os.path.abspath(__file__)
+LOCK_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "claude-voice.lock")
+_lock_fd = None
 
 # ── dev pronunciation fixes ──
 PRONOUNCE = {
@@ -136,6 +141,65 @@ BENCHMARK_SENTENCES = [
 ]
 
 
+def _acquire_lock() -> bool:
+    """Acquire an exclusive lock, killing any previous instance first.
+
+    Returns True if lock acquired, False otherwise.
+    """
+    global _lock_fd
+
+    # Kill any previous instance that's still running
+    try:
+        if os.path.exists(LOCK_PATH):
+            with open(LOCK_PATH, "r") as f:
+                old_pid = int(f.read().strip())
+            if old_pid != os.getpid():
+                try:
+                    os.kill(old_pid, signal.SIGTERM)
+                    # Brief wait for it to die and release audio
+                    time.sleep(0.15)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except (ValueError, OSError):
+        pass
+
+    # Stop any leftover audio from a dead process
+    try:
+        sd.stop()
+    except Exception:
+        pass
+
+    # Acquire exclusive file lock (non-blocking)
+    try:
+        _lock_fd = open(LOCK_PATH, "w")
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd.write(str(os.getpid()))
+        _lock_fd.flush()
+        return True
+    except (OSError, IOError):
+        # Another instance grabbed the lock between our kill and our flock
+        if _lock_fd:
+            _lock_fd.close()
+            _lock_fd = None
+        return False
+
+
+def _release_lock():
+    """Release the lock file."""
+    global _lock_fd
+    if _lock_fd:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            _lock_fd.close()
+        except (OSError, IOError):
+            pass
+        _lock_fd = None
+    try:
+        os.unlink(LOCK_PATH)
+    except OSError:
+        pass
+
+
 def _restore_terminal():
     """Restore terminal to normal mode."""
     global _old_term, _tty_fd
@@ -152,6 +216,7 @@ def _handle_signal(sig, frame):
     _interrupted = True
     sd.stop()
     _restore_terminal()
+    _release_lock()
     if _tty:
         _tty.write("\033[1A\r\033[K\033[1A\r\033[K\033[1A\r\033[K")
         _tty.write(SHOW_CURSOR)
@@ -284,6 +349,62 @@ def play_chime_end():
     sd.wait()
 
 
+# ── audio file + QuickTime ──
+
+def save_wav(audio_array: np.ndarray, filepath: str, sample_rate: int = SAMPLE_RATE):
+    """Save float32 numpy audio array as 16-bit PCM wav file."""
+    pcm = np.clip(audio_array, -1.0, 1.0)
+    pcm = (pcm * 32767).astype(np.int16)
+    with wave.open(filepath, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+
+
+def slugify(text: str, max_words: int = 5) -> str:
+    """Turn first few words into a filename-safe slug."""
+    words = re.sub(r'[^a-z0-9\s]', '', text.lower()).split()[:max_words]
+    return "_".join(words) if words else "audio"
+
+
+def get_next_filepath(audio_dir: str, text: str) -> str:
+    """Return next sequential filepath like 001_first_few_words.wav."""
+    os.makedirs(audio_dir, exist_ok=True)
+    existing = sorted(f for f in os.listdir(audio_dir) if f.endswith(".wav"))
+    next_num = 1
+    if existing:
+        # Extract number from last file
+        match = re.match(r'(\d+)', existing[-1])
+        if match:
+            next_num = int(match.group(1)) + 1
+    slug = slugify(text)
+    filename = f"{next_num:03d}_{slug}.wav"
+    return os.path.join(audio_dir, filename)
+
+
+def open_in_quicktime(filepath: str):
+    """Close existing QuickTime documents, then open new file."""
+    # Close existing QuickTime documents via AppleScript
+    close_script = '''
+    tell application "System Events"
+        if exists (process "QuickTime Player") then
+            tell application "QuickTime Player"
+                close every document
+            end tell
+        end if
+    end tell
+    '''
+    try:
+        subprocess.run(["osascript", "-e", close_script],
+                       capture_output=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    # Open the new file
+    subprocess.Popen(["open", "-a", "QuickTime Player", filepath],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ── text processing ──
 
 def is_mostly_code(text: str) -> bool:
@@ -374,6 +495,8 @@ def mini_bar(current: int, total: int, width: int = 20) -> str:
 def generate_audio(text: str, voice: str) -> tuple[list, float]:
     """Generate audio for text. Returns (sentence_audio_list, generation_time)."""
     pipe = get_pipe()
+    cfg = load_config()
+    speed = cfg.get("speed", 1.0)
     speech_text = fix_pronunciation(text)
     sentences = split_sentences(speech_text)
 
@@ -381,7 +504,7 @@ def generate_audio(text: str, voice: str) -> tuple[list, float]:
     sentence_audio = []
     for sentence in sentences:
         chunks = []
-        for result in pipe(sentence, voice=voice):
+        for result in pipe(sentence, voice=voice, speed=speed):
             chunks.append(result.audio.numpy())
         if chunks:
             sentence_audio.append(np.concatenate(chunks))
@@ -392,7 +515,8 @@ def generate_audio(text: str, voice: str) -> tuple[list, float]:
     return sentence_audio, gen_time
 
 
-def speak_and_highlight(text: str, voice: str, show_stats: bool = False) -> dict:
+def speak_and_highlight(text: str, voice: str, show_stats: bool = False,
+                        hook_mode: bool = False) -> dict:
     cfg = load_config()
     window = cfg.get("window", WINDOW)
     done_pause = cfg.get("done_pause", DONE_PAUSE)
@@ -433,6 +557,43 @@ def speak_and_highlight(text: str, voice: str, show_stats: bool = False) -> dict
     full_audio = np.concatenate(all_audio_parts)
     audio_duration = len(full_audio) / SAMPLE_RATE
 
+    ttfa = time.monotonic() - t0
+
+    # ── Hook mode: audio only, no terminal output ──
+    if hook_mode:
+        audio_dir = cfg.get("audio_dir")
+
+        if chime:
+            play_chime_start()
+
+        if audio_dir:
+            # Save wav and play via QuickTime (supports replay/scrub)
+            filepath = get_next_filepath(audio_dir, text)
+            save_wav(full_audio, filepath)
+            open_in_quicktime(filepath)
+            sys.stderr.write(f"claude-voice: saved {filepath}\n")
+        else:
+            # Fallback: play via sounddevice
+            listener = _start_keypress_listener()
+            sd.play(full_audio, samplerate=SAMPLE_RATE)
+            sd.wait()
+            _restore_terminal()
+            if not _interrupted and chime:
+                play_chime_end()
+
+        total_time = time.monotonic() - t0
+        sys.stderr.write(
+            f"claude-voice: ttfa={ttfa:.2f}s gen={gen_time:.2f}s "
+            f"total={total_time:.2f}s words={total_words} voice={voice}\n"
+        )
+        return {
+            "ttfa": ttfa, "gen_time": gen_time,
+            "audio_duration": audio_duration, "total_time": total_time,
+            "words": total_words, "chars": len(text), "voice": voice,
+        }
+
+    # ── Standalone mode: full karaoke display ──
+
     # Build global word timings
     global_timings = []
     for words, start_sample, end_sample in word_boundaries:
@@ -454,8 +615,6 @@ def speak_and_highlight(text: str, voice: str, show_stats: bool = False) -> dict
     header = f"  {LABEL}now speaking{RESET}  {LABEL}|{RESET}  {LABEL}{voice}{RESET}  {DIM}(press any key to skip){RESET}"
     tty.write(f"{header}\n\n")
     tty.flush()
-
-    ttfa = time.monotonic() - t0
 
     # Play
     playback_start = time.monotonic()
@@ -505,7 +664,6 @@ def speak_and_highlight(text: str, voice: str, show_stats: bool = False) -> dict
         "voice": voice,
     }
 
-    # Log to stderr (for hook mode)
     if not show_stats:
         sys.stderr.write(
             f"claude-voice: ttfa={ttfa:.2f}s gen={gen_time:.2f}s "
@@ -687,9 +845,11 @@ def main():
     voice = args.voice or cfg.get("voice", DEFAULT_VOICE)
 
     text = None
+    is_hook = False
     if args.text:
         text = " ".join(args.text)
     elif not sys.stdin.isatty():
+        is_hook = True  # stdin piped = running as Claude Code Stop hook
         raw = sys.stdin.read().strip()
         # Check for code-heavy responses before parsing
         try:
@@ -717,8 +877,12 @@ def main():
     if not args.long and len(text) > max_chars:
         text = text[:max_chars].rsplit(" ", 1)[0] + "..."
 
+    # Acquire exclusive lock — kills any previous instance still speaking
+    if not _acquire_lock():
+        sys.exit(0)
+
     try:
-        speak_and_highlight(text, voice)
+        speak_and_highlight(text, voice, hook_mode=is_hook)
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -726,6 +890,7 @@ def main():
         sys.exit(1)
     finally:
         _restore_terminal()
+        _release_lock()
         if _tty:
             _tty.write(SHOW_CURSOR)
             _tty.flush()
